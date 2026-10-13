@@ -499,6 +499,7 @@ struct App {
     selected: Option<u64>,
     draft: Option<Draft>,
     prompt: Option<Nav>,
+    confirm_delete: Option<u64>,
     exe_found: Option<bool>,
 
     running: HashMap<u64, Child>,
@@ -538,6 +539,9 @@ enum Message {
     StopAll,
     View(u64),
     EditBtn(u64),
+    AskDelete(u64),
+    DeleteConfirmed,
+    DeleteCancelled,
     Delete(u64),
     Start(u64),
     Kill(u64),
@@ -644,6 +648,7 @@ impl App {
             log_dir,
             draft: None,
             prompt: None,
+            confirm_delete: None,
             exe_found: None,
             running: HashMap::new(),
             pending,
@@ -913,6 +918,13 @@ impl App {
                 }
             }
             Message::PromptCancel => self.prompt = None,
+            Message::AskDelete(id) => self.confirm_delete = Some(id),
+            Message::DeleteCancelled => self.confirm_delete = None,
+            Message::DeleteConfirmed => {
+                if let Some(id) = self.confirm_delete.take() {
+                    task = self.update(Message::Delete(id));
+                }
+            }
             Message::Delete(id) => {
                 self.kill_script(id);
                 self.config.scripts.retain(|s| s.id != id);
@@ -1222,6 +1234,8 @@ impl App {
 
         if self.prompt.is_some() {
             stack![page, self.prompt_view()].into()
+        } else if self.confirm_delete.is_some() {
+            stack![page, self.delete_view()].into()
         } else {
             page.into()
         }
@@ -1256,18 +1270,46 @@ impl App {
         .width(440)
         .style(container::rounded_box);
 
-        opaque(
-            container(dialog)
-                .center_x(Length::Fill)
-                .center_y(Length::Fill)
-                .style(|_t: &Theme| container::Style {
-                    background: Some(Background::Color(Color {
-                        a: 0.6,
-                        ..Color::BLACK
-                    })),
-                    ..container::Style::default()
-                }),
+        modal(dialog.into())
+    }
+
+    fn delete_view(&self) -> Element<'_, Message> {
+        let id = self.confirm_delete.unwrap_or(0);
+        let name = self
+            .config
+            .scripts
+            .iter()
+            .find(|s| s.id == id)
+            .map(|s| s.name.as_str())
+            .unwrap_or("this entry");
+        let running_note = if self.running.contains_key(&id) {
+            "It is currently running and will be stopped. "
+        } else {
+            ""
+        };
+        let dialog = container(
+            column![
+                text("Delete script?").size(20),
+                text(format!(
+                    "“{name}” will be permanently removed. {running_note}This cannot be undone."
+                )),
+                row![
+                    button("Delete")
+                        .style(button::danger)
+                        .on_press(Message::DeleteConfirmed),
+                    button("Cancel")
+                        .style(button::secondary)
+                        .on_press(Message::DeleteCancelled),
+                ]
+                .spacing(8),
+            ]
+            .spacing(14),
         )
+        .padding(20)
+        .width(440)
+        .style(container::rounded_box);
+
+        modal(dialog.into())
     }
 
     fn script_card<'a>(&'a self, s: &'a Script) -> Element<'a, Message> {
@@ -1314,7 +1356,7 @@ impl App {
         let delete_msg = if unsaved {
             Message::DiscardDraft
         } else {
-            Message::Delete(s.id)
+            Message::AskDelete(s.id)
         };
 
         let content = column![
@@ -1532,4 +1574,21 @@ fn field_el<'a>(
     input: impl Into<Element<'a, Message>>,
 ) -> Element<'a, Message> {
     column![label.into(), input.into()].spacing(4).into()
+}
+
+/// Dims the window and blocks clicks to everything behind the dialog.
+fn modal<'a>(dialog: Element<'a, Message>) -> Element<'a, Message> {
+    opaque(
+        container(dialog)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
+            .style(|_t: &Theme| container::Style {
+                background: Some(Background::Color(Color {
+                    a: 0.6,
+                    ..Color::BLACK
+                })),
+                ..container::Style::default()
+            }),
+    )
+    .into()
 }
