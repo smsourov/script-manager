@@ -60,7 +60,6 @@ struct Script {
     args: String,
     /// Working directory (PWD). Empty = inherit from the manager.
     working_dir: String,
-    enabled: bool,
     run_at_start: bool,
     start_delay_secs: u64,
     /// Comma separated `HH:MM` list (24h, local time).
@@ -79,7 +78,6 @@ impl Default for Script {
             command: String::new(),
             args: String::new(),
             working_dir: String::new(),
-            enabled: true,
             run_at_start: false,
             start_delay_secs: 0,
             times: String::new(),
@@ -108,9 +106,7 @@ impl Script {
 
     fn summary(&self) -> String {
         let mut parts: Vec<String> = Vec::new();
-        if !self.enabled {
-            parts.push("Disabled".into());
-        } else if self.run_at_start {
+        if self.run_at_start {
             parts.push(if self.start_delay_secs > 0 {
                 format!("Runs at startup (+{}s)", self.start_delay_secs)
             } else {
@@ -119,7 +115,7 @@ impl Script {
         } else {
             parts.push("Not set to run at startup".into());
         }
-        if self.enabled && !self.parsed_times().is_empty() {
+        if !self.parsed_times().is_empty() {
             parts.push(format!("Scheduled: {}", self.times.trim()));
         }
         parts.join("  |  ")
@@ -413,6 +409,63 @@ fn send_ctrl_combo(key: u16) {
 #[cfg(not(windows))]
 fn send_ctrl_combo(_key: u16) {}
 
+// ───────────────────────────── Single instance ─────────────────────────────
+
+/// A named, auto-reset Win32 event doubles as the "is it already running?" check and as
+/// the signal telling the running instance to show its window.
+#[cfg(windows)]
+mod single {
+    use windows_sys::Win32::Foundation::{GetLastError, ERROR_ALREADY_EXISTS, HANDLE, WAIT_OBJECT_0};
+    use windows_sys::Win32::System::Threading::{CreateEventW, SetEvent, WaitForSingleObject};
+    use windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow;
+
+    pub enum Instance {
+        First(isize),
+        Already,
+    }
+
+    /// `signal`: ask an already-running instance to show its window.
+    pub fn acquire(signal: bool) -> Instance {
+        let name: Vec<u16> = "Local\\ScriptManager_ShowWindow"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        unsafe {
+            let h = CreateEventW(std::ptr::null(), 0, 0, name.as_ptr());
+            if h.is_null() {
+                return Instance::First(0); // could not create it: do not block startup
+            }
+            if GetLastError() == ERROR_ALREADY_EXISTS {
+                if signal {
+                    // Let the running instance take the foreground.
+                    AllowSetForegroundWindow(u32::MAX);
+                    SetEvent(h);
+                }
+                return Instance::Already;
+            }
+            Instance::First(h as isize)
+        }
+    }
+
+    pub fn poll(handle: isize) -> bool {
+        handle != 0 && unsafe { WaitForSingleObject(handle as HANDLE, 0) == WAIT_OBJECT_0 }
+    }
+}
+
+#[cfg(not(windows))]
+mod single {
+    pub enum Instance {
+        First(isize),
+        Already,
+    }
+    pub fn acquire(_signal: bool) -> Instance {
+        Instance::First(0)
+    }
+    pub fn poll(_handle: isize) -> bool {
+        false
+    }
+}
+
 // ───────────────────────────── Tray icon ─────────────────────────────
 
 fn make_icon() -> Icon {
@@ -456,6 +509,8 @@ struct App {
     window_id: Option<window::Id>,
     hwnd: isize,
     notice: Option<(String, bool, Instant)>,
+    entry_notice: Option<(u64, String, Instant)>,
+    instance_event: isize,
     icon_font: Font,
 
     // Tray + context menu
@@ -480,6 +535,7 @@ enum Message {
     ToggleAutostart(bool),
 
     Add,
+    StopAll,
     View(u64),
     EditBtn(u64),
     Delete(u64),
@@ -497,7 +553,6 @@ enum Message {
     WorkDir(String),
     BrowseDir,
     DirPicked(Option<PathBuf>),
-    Enabled(bool),
     RunAtStart(bool),
     Delay(String),
     Times(String),
@@ -516,6 +571,13 @@ enum Message {
 fn main() -> iced::Result {
     let minimized = std::env::args().any(|a| a == "--minimized");
 
+    // Only one manager at a time: if one is running, wake it up and exit.
+    // (A second instance started with --minimized, e.g. by autostart, stays silent.)
+    let instance_event = match single::acquire(!minimized) {
+        single::Instance::Already => return Ok(()),
+        single::Instance::First(h) => h,
+    };
+
     iced::application("Script Manager", App::update, App::view)
         .subscription(App::subscription)
         .theme(|_| Theme::Dark)
@@ -525,11 +587,11 @@ fn main() -> iced::Result {
             visible: !minimized,
             ..Default::default()
         })
-        .run_with(move || App::new(minimized))
+        .run_with(move || App::new(minimized, instance_event))
 }
 
 impl App {
-    fn new(_minimized: bool) -> (Self, Task<Message>) {
+    fn new(_minimized: bool, instance_event: isize) -> (Self, Task<Message>) {
         let dir = data_dir();
         let log_dir = dir.join("logs");
         let _ = fs::create_dir_all(&log_dir);
@@ -564,7 +626,7 @@ impl App {
         let pending = config
             .scripts
             .iter()
-            .filter(|s| s.enabled && s.run_at_start)
+            .filter(|s| s.run_at_start)
             .map(|s| (s.id, now + Duration::from_secs(s.start_delay_secs)))
             .collect();
 
@@ -590,6 +652,8 @@ impl App {
             window_id: None,
             hwnd: 0,
             notice: None,
+            entry_notice: None,
+            instance_event,
             icon_font,
             _tray: tray,
             show_id: show_item.id().clone(),
@@ -662,7 +726,7 @@ impl App {
         self.draft = None;
         self.selected = Some(id);
         self.save();
-        self.notify("Saved.", false);
+        self.entry_notice = Some((id, "Saved.".into(), Instant::now()));
         true
     }
 
@@ -808,6 +872,17 @@ impl App {
 
             // ── navigation / entries ──
             Message::Add => self.request_nav(Nav::Add),
+            Message::StopAll => {
+                let n = self.running.len();
+                self.pending.clear();
+                self.kill_all();
+                let msg = if n > 0 {
+                    format!("Stopped {n} script(s).")
+                } else {
+                    String::from("Cancelled pending starts.")
+                };
+                self.notify(msg, false);
+            }
             Message::View(id) => self.request_nav(Nav::View(id)),
             Message::EditBtn(id) => self.request_nav(Nav::Edit(id)),
             Message::SaveDraft => {
@@ -877,7 +952,6 @@ impl App {
                     self.edit_draft(|s| s.working_dir = p.display().to_string());
                 }
             }
-            Message::Enabled(v) => self.edit_draft(|s| s.enabled = v),
             Message::RunAtStart(v) => self.edit_draft(|s| s.run_at_start = v),
             Message::Delay(v) => {
                 let v = v.trim();
@@ -966,6 +1040,17 @@ impl App {
             }
         }
 
+        if let Some((_, _, t)) = &self.entry_notice {
+            if t.elapsed() > Duration::from_secs(4) {
+                self.entry_notice = None;
+            }
+        }
+
+        // Another instance was launched: bring this window to the front.
+        if single::poll(self.instance_event) {
+            task = Task::batch([task, self.show_window()]);
+        }
+
         // 1. Tray + context-menu events.
         while let Ok(ev) = MenuEvent::receiver().try_recv() {
             if ev.id == self.show_id {
@@ -1031,9 +1116,7 @@ impl App {
                 .scripts
                 .iter()
                 .filter(|s| {
-                    s.enabled
-                        && s.days[wd]
-                        && s.parsed_times().contains(&(now.hour(), now.minute()))
+                    s.days[wd] && s.parsed_times().contains(&(now.hour(), now.minute()))
                 })
                 .map(|s| s.id)
                 .collect();
@@ -1062,6 +1145,9 @@ impl App {
         let top = row![
             text("Script Manager").size(24),
             horizontal_space(),
+            button("Stop all")
+                .style(button::danger)
+                .on_press_maybe((!self.running.is_empty() || !self.pending.is_empty()).then_some(Message::StopAll)),
             button("Import").on_press(Message::Import),
             button("Export").on_press(Message::Export),
             button("Hide to tray").on_press(Message::HideToTray),
@@ -1070,9 +1156,25 @@ impl App {
         .spacing(8)
         .align_y(Alignment::Center);
 
+        // Global notices live in this row, so showing one never shifts the layout.
+        let notice_el: Element<Message> = match &self.notice {
+            Some((msg, is_err, _)) => container(
+                text(msg.as_str())
+                    .size(13)
+                    .color(if *is_err { RED } else { GREEN }),
+            )
+            .padding(Padding {
+                left: 14.0,
+                ..Padding::ZERO
+            })
+            .width(Length::Fill)
+            .into(),
+            None => horizontal_space().into(),
+        };
+
         let second = row![
             button("+ Add script").on_press(Message::Add),
-            horizontal_space(),
+            notice_el,
             checkbox("Start with Windows", self.config.start_with_windows)
                 .on_toggle(Message::ToggleAutostart),
         ]
@@ -1114,11 +1216,9 @@ impl App {
         .height(Length::Fill)
         .style(container::bordered_box);
 
-        let mut page = column![top, second].spacing(10).padding(14);
-        if let Some((msg, is_err, _)) = &self.notice {
-            page = page.push(text(msg).size(13).color(if *is_err { RED } else { GREEN }));
-        }
-        let page = page.push(row![left, right].spacing(14).height(Length::Fill));
+        let page = column![top, second, row![left, right].spacing(14).height(Length::Fill)]
+            .spacing(10)
+            .padding(14);
 
         if self.prompt.is_some() {
             stack![page, self.prompt_view()].into()
@@ -1176,7 +1276,7 @@ impl App {
         let unsaved = editing && self.draft.as_ref().is_some_and(|d| d.is_new);
         let viewing = self.selected == Some(s.id) && !editing;
 
-        let (bg_normal, bg_edit, border_col) = if s.enabled && s.run_at_start {
+        let (bg_normal, bg_edit, border_col) = if s.run_at_start {
             STARTUP_ON
         } else {
             STARTUP_OFF
@@ -1204,6 +1304,12 @@ impl App {
         };
 
         let status = self.status.get(&s.id).map(String::as_str).unwrap_or("");
+        let entry_note = self
+            .entry_notice
+            .as_ref()
+            .filter(|(id, _, _)| *id == s.id)
+            .map(|(_, m, _)| m.as_str())
+            .unwrap_or("");
 
         let delete_msg = if unsaved {
             Message::DiscardDraft
@@ -1219,7 +1325,12 @@ impl App {
                 state
             ]
             .align_y(Alignment::Center),
-            text(s.summary()).size(12),
+            row![
+                text(s.summary()).size(12),
+                horizontal_space(),
+                text(entry_note).size(12).color(GREEN),
+            ]
+            .align_y(Alignment::Center),
             text(status).size(12).color(GRAY),
             row![
                 button("Start")
@@ -1335,8 +1446,6 @@ impl App {
 
         column![
             text(title).size(20),
-            checkbox("Enabled (allows automatic launches)", s.enabled)
-                .on_toggle_maybe(editable.then_some(Message::Enabled)),
             field("Name", name_row),
             field_el(
                 cmd_label,
