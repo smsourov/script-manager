@@ -1,11 +1,12 @@
 [package]
 name = "script-manager"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
 iced = { version = "0.13", features = ["tokio"] }
 tray-icon = "0.19"
+raw-window-handle = "0.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = "0.4"
@@ -14,6 +15,7 @@ rfd = "0.15"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.52"
+windows-sys = { version = "0.59", features = ["Win32_UI_Input_KeyboardAndMouse"] }
 
 [profile.release]
 opt-level = 3
