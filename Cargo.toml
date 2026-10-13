@@ -1,0 +1,21 @@
+[package]
+name = "script-manager"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+iced = { version = "0.13", features = ["tokio"] }
+tray-icon = "0.19"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = "0.4"
+dirs = "5"
+rfd = "0.15"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.52"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
