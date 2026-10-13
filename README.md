@@ -2,9 +2,9 @@
 
 ## The Code
 
-- [ ] Vibe coded
+- [x] Vibe coded
 
-- [x] Vibe coded and manually modified
+- [ ] Vibe coded and manually modified
 
 - AI model
     
